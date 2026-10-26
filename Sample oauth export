@@ -1,0 +1,10 @@
+Application Name,User email,Scopes,Last used
+ChatGPT,ana@acme.mx,https://www.googleapis.com/auth/drive.readonly,2026-10-10
+ChatGPT,luis@acme.mx,https://www.googleapis.com/auth/drive.readonly,2026-09-30
+Otter.ai,ana@acme.mx,https://www.googleapis.com/auth/calendar https://mail.google.com/,2026-03-02
+Fireflies.ai Notetaker,pedro@acme.mx,https://www.googleapis.com/auth/calendar,2026-10-15
+Drift Email,sales@acme.mx,https://mail.google.com/ offline_access,2025-08-01
+Claude,farida@acme.mx,https://www.googleapis.com/auth/drive.file,2026-10-16
+Smart Inbox Assistant,luis@acme.mx,https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.modify,
+Airtable,ana@acme.mx,https://www.googleapis.com/auth/drive,2026-10-01
+Metabase,ops@acme.mx,https://www.googleapis.com/auth/admin.directory.user.readonly,2026-10-01
