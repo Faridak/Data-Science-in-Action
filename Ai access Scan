@@ -9,10 +9,11 @@ Two inputs, both exports you can pull from tools you already own:
            filter. Needs columns for user and domain.
 
 Output:
-  - A summary on screen: which AI apps hold which access, which are risky,
-    which have not been used in 90 days, and who uses AI websites.
-  - ai_access_register.csv: the register from Question 9, pre-filled,
-    ready for you to assign owners and decide keep or revoke.
+  - A summary on screen: each AI connection's exposure, the data behind it,
+    what it can do, a risk score, and who uses AI websites.
+  - ai_access_register.csv: register rows with exposure (reachable, from where,
+    which untrusted input reaches it) and the data and systems behind it,
+    ready to paste into columns A to N of the AI access register spreadsheet.
 
 Where to get the apps file:
 
@@ -46,8 +47,13 @@ Other sources: map your own column names with --map, e.g.
   --map app="Application Name" user="User email" scopes=Scopes last_used="Last used"
   --web-map user="Source user" domain="Destination host"
 
+Reachability: the scanner records every connection as reachable from the
+Internet, because a token held in a vendor's cloud usually is, and it cannot see
+IP restrictions or conditional-access rules. Correct the Reachable from column
+by hand where access is restricted.
+
 Standard library only, Python 3.9+. Read-only: it never changes or revokes
-anything. Edit AI_DOMAINS and RISKY_SCOPES to suit your company.
+anything. Edit AI_DOMAINS and SCOPE_FACTS to suit your company.
 Usage: python ai_access_scan.py --apps oauth_export.csv [--preset google] [--web proxy_log.csv]
 
 Exit codes: 0 = success, 1 = error, 2 = no AI tools found.
@@ -77,28 +83,46 @@ AI_NAME_HINTS = re.compile(
     r"|llama|\bai\b|assistant|agent|otter|fireflies|notetaker|drift|chatbot|meta",
     re.IGNORECASE)
 
-# Scopes that let an app read or act on a lot. Google and Microsoft examples.
-# Keys are the last part of the scope name, e.g. .../auth/gmail.send -> gmail.send
-RISKY_SCOPES = {
-    "mail.google.com": "full Gmail access",
-    "gmail.modify": "read and change email", "gmail.send": "send email",
-    "gmail.readonly": "read all email",
-    "drive": "full Google Drive", "drive.readonly": "read all Drive files",
-    "admin.directory": "Google admin directory", "calendar": "full calendar",
-    "mail.readwrite": "read and change Outlook mail", "mail.send": "send Outlook mail",
-    "mail.read": "read all Outlook mail",
-    "files.readwrite.all": "change all OneDrive/SharePoint files",
-    "files.read.all": "read all OneDrive/SharePoint files",
-    "sites.read.all": "read all SharePoint sites",
-    "sites.readwrite.all": "change all SharePoint sites",
-    "directory.readwrite.all": "change the directory",
-    "offline_access": "keeps access when the user is away",
-    "refresh_token": "long-lived access",
-    "full": "broad access (Salesforce/CRM)",
-    "api": "API access (check scope details — may be broad)",
+# What each risky scope exposes. Keys are the last part of the scope name,
+# e.g. .../auth/gmail.send -> gmail.send. Each entry:
+#   (what it grants, untrusted input it lets in, data behind it, what it can do)
+# Data: Public < Internal < Confidential < Regulated (personal, health, payment,
+# government data). Action: Read < Write < External < Destructive.
+SCOPE_FACTS = {
+    "mail.google.com": ("full Gmail access", "inbound email from anyone", "Confidential", "Destructive"),
+    "gmail.modify": ("read and change email", "inbound email from anyone", "Confidential", "Write"),
+    "gmail.send": ("send email", None, "Internal", "External"),
+    "gmail.readonly": ("read all email", "inbound email from anyone", "Confidential", "Read"),
+    "drive": ("full Google Drive", "files shared in from outside", "Confidential", "Destructive"),
+    "drive.readonly": ("read all Drive files", "files shared in from outside", "Confidential", "Read"),
+    "admin.directory": ("Google admin directory", None, "Confidential", "Destructive"),
+    "admin.directory.readonly": ("read Google admin directory", None, "Confidential", "Read"),
+    "calendar": ("full calendar", "invites from anyone", "Internal", "Write"),
+    "mail.readwrite": ("read and change Outlook mail", "inbound email from anyone", "Confidential", "Write"),
+    "mail.send": ("send Outlook mail", None, "Internal", "External"),
+    "mail.read": ("read all Outlook mail", "inbound email from anyone", "Confidential", "Read"),
+    "files.readwrite.all": ("change all OneDrive/SharePoint files", "files shared in from outside", "Confidential", "Destructive"),
+    "files.read.all": ("read all OneDrive/SharePoint files", "files shared in from outside", "Confidential", "Read"),
+    "sites.read.all": ("read all SharePoint sites", "files shared in from outside", "Confidential", "Read"),
+    "sites.readwrite.all": ("change all SharePoint sites", "files shared in from outside", "Confidential", "Destructive"),
+    "directory.readwrite.all": ("change the directory", None, "Confidential", "Destructive"),
+    "offline_access": ("keeps access when the user is away", None, None, "Read"),
+    "api": ("API access (check scope details — may be broad)", None, "Regulated", "Destructive"),
+    "refresh_token": ("long-lived access", None, None, "Read"),
 }
 PREFIX_SCOPES = {"admin.directory"}  # admin.directory.user, .group... all count
 STALE_DAYS = 90
+
+# Scoring: the same scales and formula as the register spreadsheet.
+REACH = {"Internet": 3, "Corporate network": 2, "Single device": 1}
+DATA = {"Public": 1, "Internal": 2, "Confidential": 3, "Regulated": 4}
+ACTION = {"Read": 1, "Write": 2, "External": 3, "Destructive": 4}
+
+
+def rate(score):
+    return ("Critical" if score >= 32 else "High" if score >= 16
+            else "Medium" if score >= 8 else "Low")
+
 
 PRESETS = {
     "google": {"app": "Application name", "user": "User", "scopes": "Scope",
@@ -147,21 +171,52 @@ def _clean_domain(domain):
 
 
 def risky(scopes):
-    """Return a sorted list of risky scope descriptions found in the scope string."""
-    hits = []
+    """Return the SCOPE_FACTS keys found in a scope string."""
+    hits = set()
     for token in re.split(r"[,;\s|]+", scopes):
         token = token.strip()
         if not token:
             continue
         seg = token.lower().rstrip("/").rsplit("/", 1)[-1]
-        for key, meaning in RISKY_SCOPES.items():
-            if seg == key or (key in PREFIX_SCOPES and seg.startswith(key)):
-                hits.append(meaning)
-    return sorted(set(hits))
+        if seg.startswith("admin.directory"):
+            hits.add("admin.directory.readonly" if seg.endswith("readonly") else "admin.directory")
+        elif seg in SCOPE_FACTS:
+            hits.add(seg)
+    return sorted(hits)
+
+
+def assess(keys, reach="Internet"):
+    """Exposure, data and action for one connection, scored like the spreadsheet."""
+    facts = [SCOPE_FACTS[k] for k in keys]
+    sources = sorted({f[1] for f in facts if f[1]})
+    data_levels = [f[2] for f in facts if f[2]] or ["Internal"]
+    data = max(data_levels, key=DATA.get)
+    action = max([f[3] for f in facts] or ["Read"], key=ACTION.get)
+    exposure = REACH[reach] + (1 if sources else 0)
+    score = exposure * DATA[data] * ACTION[action]
+    rule_of_two = (1 if sources else 0) + (DATA[data] >= 3) + (ACTION[action] >= 2)
+    return {"reach": reach, "sources": sources, "systems": [f[0] for f in facts],
+            "data": data, "action": action, "exposure": exposure, "score": score,
+            "rating": rate(score), "rule_of_two": rule_of_two}
+
+
+def suggest(stale, a):
+    if stale:
+        return "Revoke unless a current use is named"
+    if a["rule_of_two"] == 3:
+        return "Add human approval or remove one of the three"
+    return {"Critical": "Fix now", "High": "Fix this quarter",
+            "Medium": "Reduce access at next review", "Low": "Keep and review"}.get(a["rating"], "Review")
+
+
+def is_approved(label, approved_list):
+    """Case-insensitive substring match for approved services."""
+    label_lower = label.lower()
+    return any(a.lower() in label_lower or label_lower in a.lower() for a in approved_list)
 
 
 def parse_date(text):
-    """Accept ISO dates, US and day-first dates, and console-style 'Oct 15, 2026, ...'."""
+    """Accept ISO dates, US and day-first dates, console-style, and Unix timestamps."""
     text = (text or "").strip()
     if not text:
         return None
@@ -249,10 +304,8 @@ def scan_apps(rows, now):
     results = []
     for name, a in apps.items():
         stale = a["last"] is None or (now - a["last"]) > timedelta(days=STALE_DAYS)
-        level = "HIGH" if a["scopes"] and stale else "MEDIUM" if a["scopes"] or stale else "LOW"
-        results.append({"name": name, **a, "stale": stale, "level": level})
-    order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-    return sorted(results, key=lambda x: (order[x["level"]], -len(x["users"])))
+        results.append({"name": name, **a, "stale": stale, **assess(sorted(a["scopes"]))})
+    return sorted(results, key=lambda x: (-x["score"], -len(x["users"])))
 
 
 def scan_web(rows):
@@ -265,12 +318,6 @@ def scan_web(rows):
     return use
 
 
-def is_approved(label, approved_list):
-    """Case-insensitive substring match for approved services."""
-    label_lower = label.lower()
-    return any(a.lower() in label_lower or label_lower in a.lower() for a in approved_list)
-
-
 def main():
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -281,8 +328,7 @@ def main():
     )
     p.add_argument("--apps", required=True, help="CSV of OAuth app grants")
     p.add_argument("--web", help="CSV of web/proxy traffic (optional)")
-    p.add_argument("--preset", choices=sorted(PRESETS),
-                   help="Column names for a known export (google, entra)")
+    p.add_argument("--preset", choices=sorted(PRESETS), help="Column names for a known export (google, entra)")
     p.add_argument("--map", nargs="*", default=[],
                    help='Apps file column mapping: key="Column name" pairs. '
                         'Keys: app, user, scopes, last_used. '
@@ -327,25 +373,28 @@ def main():
         try:
             with open(args.out, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                w.writerow(["Tool or agent", "Owner", "Systems it can reach",
-                            "Can it act or only read?", "Who approves its actions",
-                            "Review date", "Risk", "Users", "Last used", "Decision"])
+                w.writerow(["ID", "Tool or agent", "Type", "Owner", "Users", "Last used",
+                            "Reachable?", "Reachable from", "Untrusted input?", "Untrusted input from",
+                            "Systems behind it", "Most sensitive data", "Data details", "Can it act?"])
         except (OSError, IOError) as e:
             sys.exit(f"Error writing output file: {e}")
         print(f"Empty register written to {args.out}.")
         sys.exit(2)
 
-    print(f"\nAI CONNECTIONS FOUND: {len(apps)}  "
-          f"(risk: HIGH = broad access and unused {STALE_DAYS}+ days)\n")
+    print(f"\nAI CONNECTIONS FOUND: {len(apps)}")
+    print("Risk score = exposure x data behind it x what it can do (same as the register)\n")
     for a in apps:
         last = a["last"].date().isoformat() if a["last"] else "never/unknown"
-        print(f"[{a['level']}] {a['name']}  ({a['label']})")
         who = "ALL USERS (tenant-wide consent)" if "ALL USERS" in a["users"] else len(a["users"])
+        print(f"[{a['rating']} {a['score']}] {a['name']}  ({a['label']})")
         print(f"   users: {who}   last used: {last}")
-        if a["scopes"]:
-            print(f"   access: {', '.join(sorted(a['scopes']))}")
-        if a["level"] == "HIGH":
-            print("   -> revoke unless someone can name a current use")
+        print(f"   reachable from: {a['reach']} (assumed: check by hand)   untrusted input: "
+              f"{', '.join(a['sources']) or 'none found'}")
+        print(f"   behind it: {', '.join(a['systems']) or 'limited scopes'}  "
+              f"(data: {a['data']}, can: {a['action']})")
+        if a["rule_of_two"] == 3:
+            print("   ! all three Rule of Two properties")
+        print(f"   -> {suggest(a['stale'], a)}")
 
     web = {}
     if args.web:
@@ -364,27 +413,31 @@ def main():
     try:
         with open(args.out, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["Tool or agent", "Owner", "Systems it can reach",
-                        "Can it act or only read?", "Who approves its actions",
-                        "Review date", "Risk", "Users", "Last used", "Decision"])
+            w.writerow(["ID", "Tool or agent", "Type", "Owner", "Users", "Last used",
+                        "Reachable?", "Reachable from", "Untrusted input?", "Untrusted input from",
+                        "Systems behind it", "Most sensitive data", "Data details", "Can it act?"])
+            n = 0
             for a in apps:
-                acts = any(k in s for s in a["scopes"] for k in ("send", "change", "full", "modify"))
-                w.writerow([a["name"], "", "; ".join(sorted(a["scopes"])) or "limited",
-                            "Can act" if acts else "Read only / unclear", "", review, a["level"],
-                            "all" if "ALL USERS" in a["users"] else len(a["users"]),
-                            a["last"].date().isoformat() if a["last"] else "unknown",
-                            "keep / revoke?"])
-            for label, users in web.items():
-                if not is_approved(label, args.approved):
-                    w.writerow([f"{label} (website)", "", "whatever staff paste in", "n/a", "", review,
-                                "MEDIUM", len(users), "", "approve or block?"])
+                n += 1
+                w.writerow([f"AI-{n:03d}", a["name"], "Connected app", "",
+                            "All" if "ALL USERS" in a["users"] else len(a["users"]),
+                            a["last"].date().isoformat() if a["last"] else "",
+                            "Yes", a["reach"], "Yes" if a["sources"] else "No",
+                            "; ".join(a["sources"]), "; ".join(a["systems"]) or "limited scopes",
+                            a["data"], "Check: upgrade to Regulated if it holds personal, health, "
+                            "payment or government data", a["action"]])
+            for label, users in sorted(web.items()):
+                if is_approved(label, args.approved):
+                    continue
+                n += 1
+                w.writerow([f"AI-{n:03d}", f"{label} (website)", "AI website", "", len(users), "",
+                            "Yes", "Internet", "No", "", "whatever staff paste in", "Confidential",
+                            "Unknown: assume confidential until surveyed", "External"])
     except (OSError, IOError) as e:
         sys.exit(f"Error writing output file: {e}")
 
-    print(f"\nRegister written to {args.out}. Fill in Owner and Decision for each row.\n")
-    print("Note: Risk levels (HIGH/MEDIUM/LOW) are triage indicators, not the calculated")
-    print("risk score from Question 9 (Exposure x Data x Action). Calculate the score")
-    print("manually for each row using the register spreadsheet or the formula in Q9.\n")
+    print(f"\nRegister rows written to {args.out}: paste them into columns A to N of the\n"
+          "Register tab. The spreadsheet calculates risk, rating and deferral status.\n")
 
 
 if __name__ == "__main__":
