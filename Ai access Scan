@@ -1,0 +1,311 @@
+"""ai_access_scan.py: find the AI tools and AI connections your company already has.
+
+Two inputs, both exports you can pull from tools you already own:
+
+  --apps   A CSV of third-party apps holding access tokens (OAuth grants),
+           exported from Google Workspace, Microsoft Entra, Slack, GitHub...
+           Needs columns for app name, user, scopes and last-used date.
+  --web    (optional) A CSV of web traffic from your proxy, firewall or DNS
+           filter. Needs columns for user and domain.
+
+Output:
+  - A summary on screen: which AI apps hold which access, which are risky,
+    which have not been used in 90 days, and who uses AI websites.
+  - ai_access_register.csv: the register from Question 9, pre-filled,
+    ready for you to assign owners and decide keep or revoke.
+
+Column names differ between products, so map them with --map, e.g.
+  --map app="Application Name" user="User email" scopes=Scopes last_used="Last used"
+  --web-map user="Source user" domain="Destination host"
+
+Standard library only, Python 3.9+. Read-only: it never changes or revokes
+anything. Edit AI_DOMAINS and RISKY_SCOPES to suit your company.
+Usage: python ai_access_scan.py --apps oauth_export.csv [--web proxy_log.csv]
+"""
+import argparse
+import csv
+import re
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+
+# Known AI services. Matched against app names and web domains (lowercase).
+AI_DOMAINS = {
+    "openai.com": "OpenAI / ChatGPT", "chatgpt.com": "OpenAI / ChatGPT",
+    "claude.ai": "Anthropic Claude", "anthropic.com": "Anthropic Claude",
+    "gemini.google.com": "Google Gemini", "notebooklm.google.com": "Google NotebookLM",
+    "copilot.microsoft.com": "Microsoft Copilot", "perplexity.ai": "Perplexity",
+    "deepseek.com": "DeepSeek", "mistral.ai": "Mistral", "grok.com": "xAI Grok",
+    "x.ai": "xAI Grok", "meta.ai": "Meta AI", "poe.com": "Poe",
+    "character.ai": "Character.AI", "huggingface.co": "Hugging Face",
+    "otter.ai": "Otter (meeting notes)", "fireflies.ai": "Fireflies (meeting notes)",
+    "read.ai": "Read AI (meeting notes)", "jasper.ai": "Jasper",
+    "gamma.app": "Gamma", "manus.im": "Manus",
+}
+AI_NAME_HINTS = re.compile(
+    r"gpt|openai|claude|anthropic|gemini|copilot|perplexity|deepseek|mistral|grok"
+    r"|llama|\bai\b|assistant|agent|otter|fireflies|notetaker|drift|chatbot|meta",
+    re.IGNORECASE)
+
+# Scopes that let an app read or act on a lot. Google and Microsoft examples.
+# Keys are the last part of the scope name, e.g. .../auth/gmail.send -> gmail.send
+RISKY_SCOPES = {
+    "mail.google.com": "full Gmail access",
+    "gmail.modify": "read and change email", "gmail.send": "send email",
+    "gmail.readonly": "read all email",
+    "drive": "full Google Drive", "drive.readonly": "read all Drive files",
+    "admin.directory": "Google admin directory", "calendar": "full calendar",
+    "mail.readwrite": "read and change Outlook mail", "mail.send": "send Outlook mail",
+    "mail.read": "read all Outlook mail",
+    "files.readwrite.all": "all OneDrive/SharePoint files",
+    "sites.readwrite.all": "all SharePoint sites",
+    "directory.readwrite.all": "change the directory",
+    "offline_access": "keeps access when the user is away",
+    "refresh_token": "long-lived access",
+    "full": "broad access (Salesforce/CRM)",
+    "api": "API access (check scope details)",
+}
+PREFIX_SCOPES = {"admin.directory"}  # admin.directory.user, .group... all count
+STALE_DAYS = 90
+
+
+def classify(name):
+    """Classify an app name or domain as a known AI service or possible AI tool."""
+    low = name.lower().strip()
+    # Strip protocol and path if a full URL was passed
+    low = re.sub(r"^https?://", "", low)
+    low = low.split("/")[0]
+    low = low.split("?")[0]
+
+    # Exact domain match or subdomain
+    for domain, label in AI_DOMAINS.items():
+        if low == domain or low.endswith("." + domain):
+            return label
+        # Domain as a standalone word (e.g., app name "chatgpt.com")
+        if domain in low.split():
+            return label
+
+    # Domain stem as substring (e.g., "openai" in "OpenAI ChatGPT")
+    for domain, label in AI_DOMAINS.items():
+        stem = domain.split(".")[0]
+        if len(stem) > 3 and stem not in {"read", "gamma"} and stem in low:
+            return label
+
+    # Name hints (regex)
+    if AI_NAME_HINTS.search(name):
+        return "Possible AI tool (check)"
+
+    return None
+
+
+def risky(scopes):
+    """Return a sorted list of risky scope descriptions found in the scope string."""
+    hits = []
+    for token in re.split(r"[,;\s|]+", scopes):
+        token = token.strip()
+        if not token:
+            continue
+        seg = token.lower().rstrip("/").rsplit("/", 1)[-1]
+        for key, meaning in RISKY_SCOPES.items():
+            if seg == key or (key in PREFIX_SCOPES and seg.startswith(key)):
+                hits.append(meaning)
+    return sorted(set(hits))
+
+
+def parse_date(text):
+    text = (text or "").strip()
+    if not text:
+        return None
+    formats = (
+        "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S",
+        "%m/%d/%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S",
+    )
+    for fmt in formats:
+        try:
+            d = datetime.strptime(text, fmt)
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    # Try Unix timestamp
+    try:
+        ts = float(text)
+        if ts > 1_000_000_000:  # plausible Unix timestamp
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except (ValueError, OSError, OverflowError):
+        pass
+    return None
+
+
+def load(path, mapping, needed):
+    """Load a CSV file and return a list of dicts with normalized keys."""
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                sys.exit(f"Error: {path} is empty or has no header row.")
+            cols = {k: mapping.get(k, k) for k in needed}
+            missing = [c for c in cols.values() if c not in reader.fieldnames]
+            if missing:
+                sys.exit(f"{path}: missing column(s) {missing}. Found: {reader.fieldnames}. "
+                         f"Use --map to specify column names.")
+            rows = list(reader)
+            if not rows:
+                print(f"Warning: {path} has headers but no data rows.", file=sys.stderr)
+            return [{k: (row[c] or "") for k, c in cols.items()} for row in rows]
+    except FileNotFoundError:
+        sys.exit(f"Error: file not found: {path}")
+    except IsADirectoryError:
+        sys.exit(f"Error: path is a directory: {path}")
+    except (OSError, IOError) as e:
+        sys.exit(f"Error reading file: {e}")
+
+
+def scan_apps(rows, now):
+    apps = defaultdict(lambda: {"users": set(), "scopes": set(), "last": None})
+    for r in rows:
+        label = classify(r["app"])
+        if not label:
+            continue
+        a = apps[r["app"]]
+        a["label"] = label
+        a["users"].add(r["user"])
+        a["scopes"].update(risky(r["scopes"]))
+        d = parse_date(r["last_used"])
+        if d and (a["last"] is None or d > a["last"]):
+            a["last"] = d
+    results = []
+    for name, a in apps.items():
+        stale = a["last"] is None or (now - a["last"]) > timedelta(days=STALE_DAYS)
+        level = "HIGH" if a["scopes"] and stale else "MEDIUM" if a["scopes"] or stale else "LOW"
+        results.append({"name": name, **a, "stale": stale, "level": level})
+    order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    return sorted(results, key=lambda x: (order[x["level"]], -len(x["users"])))
+
+
+def scan_web(rows):
+    use = defaultdict(lambda: defaultdict(int))
+    for r in rows:
+        domain = re.sub(r"^https?://", "", r["domain"].strip().lower())
+        domain = domain.split("/")[0].split("?")[0]
+        label = classify(domain)
+        if label and label != "Possible AI tool (check)":
+            use[label][r["user"]] += 1
+    return use
+
+
+def is_approved(label, approved_list):
+    """Case-insensitive substring match for approved services."""
+    label_lower = label.lower()
+    return any(a.lower() in label_lower or label_lower in a.lower() for a in approved_list)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Exit codes: 0 = success, 1 = error, 2 = no AI tools found.\n"
+               "Mapping example: --map app=\"Application Name\" user=\"User email\" "
+               "scopes=Scopes last_used=\"Last used\"",
+    )
+    p.add_argument("--apps", required=True, help="CSV of OAuth app grants")
+    p.add_argument("--web", help="CSV of web/proxy traffic (optional)")
+    p.add_argument("--map", nargs="*", default=[],
+                   help='Apps file column mapping: key="Column name" pairs. '
+                        'Keys: app, user, scopes, last_used. '
+                        'Example: --map app="Application Name" user="User email"')
+    p.add_argument("--web-map", nargs="*", default=[],
+                   help='Web file column mapping: key="Column name" pairs. '
+                        'Keys: user, domain. '
+                        'Example: --web-map user="Source user" domain="Destination host"')
+    p.add_argument("--approved", nargs="*", default=[],
+                   help="AI services your company has approved (case-insensitive, "
+                        "substring match). E.g.: --approved \"Anthropic Claude\" \"OpenAI / ChatGPT\"")
+    p.add_argument("--out", default="ai_access_register.csv",
+                   help="Output register CSV path (default: ai_access_register.csv)")
+    args = p.parse_args()
+
+    # Validate --map syntax
+    mapping = {}
+    for m in args.map:
+        if "=" not in m:
+            sys.exit(f"Error: invalid --map entry '{m}'. Expected format: key=\"Column name\"")
+        k, v = m.split("=", 1)
+        mapping[k.strip()] = v.strip().strip('"').strip("'")
+
+    now = datetime.now(timezone.utc)
+
+    rows = load(args.apps, mapping, ["app", "user", "scopes", "last_used"])
+    apps = scan_apps(rows, now)
+
+    if not apps:
+        print("No AI tools found in the apps export.", file=sys.stderr)
+        # Still write empty register
+        with open(args.out, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["Tool or agent", "Owner", "Systems it can reach",
+                        "Can it act or only read?", "Who approves its actions",
+                        "Review date", "Risk", "Users", "Last used", "Decision"])
+        print(f"Empty register written to {args.out}.")
+        sys.exit(2)
+
+    print(f"\nAI CONNECTIONS FOUND: {len(apps)}  "
+          f"(risk: HIGH = broad access and unused {STALE_DAYS}+ days)\n")
+    for a in apps:
+        last = a["last"].date().isoformat() if a["last"] else "never/unknown"
+        print(f"[{a['level']}] {a['name']}  ({a['label']})")
+        print(f"   users: {len(a['users'])}   last used: {last}")
+        if a["scopes"]:
+            print(f"   access: {', '.join(sorted(a['scopes']))}")
+        if a["level"] == "HIGH":
+            print("   -> revoke unless someone can name a current use")
+
+    web_mapping = {}
+    for m in args.web_map:
+        if "=" not in m:
+            sys.exit(f"Error: invalid --web-map entry '{m}'. Expected format: key=\"Column name\"")
+        k, v = m.split("=", 1)
+        web_mapping[k.strip()] = v.strip().strip('"').strip("'")
+
+    web = {}
+    if args.web:
+        web_rows = load(args.web, web_mapping, ["user", "domain"])
+        web = scan_web(web_rows)
+
+    if web:
+        print("\nAI WEBSITES IN USE (possible shadow AI)\n")
+        for label, users in sorted(web.items(), key=lambda kv: -sum(kv[1].values())):
+            flag = "approved" if is_approved(label, args.approved) else "NOT APPROVED"
+            n, v = len(users), sum(users.values())
+            print(f"  {label}: {n} {'person' if n == 1 else 'people'}, "
+                  f"{v} visit{'' if v == 1 else 's'} [{flag}]")
+
+    review = (now + timedelta(days=90)).date().isoformat()
+    try:
+        with open(args.out, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["Tool or agent", "Owner", "Systems it can reach",
+                        "Can it act or only read?", "Who approves its actions",
+                        "Review date", "Risk", "Users", "Last used", "Decision"])
+            for a in apps:
+                acts = any(k in s for s in a["scopes"] for k in ("send", "change", "full", "modify"))
+                w.writerow([a["name"], "", "; ".join(sorted(a["scopes"])) or "limited",
+                            "Can act" if acts else "Read only / unclear", "", review, a["level"],
+                            len(a["users"]), a["last"].date().isoformat() if a["last"] else "unknown",
+                            "keep / revoke?"])
+            for label, users in web.items():
+                if not is_approved(label, args.approved):
+                    w.writerow([f"{label} (website)", "", "whatever staff paste in", "n/a", "", review,
+                                "MEDIUM", len(users), "", "approve or block?"])
+    except (OSError, IOError) as e:
+        sys.exit(f"Error writing output file: {e}")
+
+    print(f"\nRegister written to {args.out}. Fill in Owner and Decision for each row.\n")
+    print("Note: Risk levels (HIGH/MEDIUM/LOW) are triage indicators, not the calculated")
+    print("risk score from Question 9 (Exposure x Data x Action). Calculate the score")
+    print("manually for each row using the register spreadsheet or the formula in Q9.\n")
+
+
+if __name__ == "__main__":
+    main()
