@@ -14,13 +14,43 @@ Output:
   - ai_access_register.csv: the register from Question 9, pre-filled,
     ready for you to assign owners and decide keep or revoke.
 
-Column names differ between products, so map them with --map, e.g.
+Where to get the apps file:
+
+  Google Workspace: Admin console > Reporting > Audit and investigation >
+    OAuth log events > Export all (to Sheets, then File > Download > CSV).
+    Then run with --preset google. The preset uses Google's documented
+    column names (Application name, User, Scope, Date, Event); check them
+    against your export's header row the first time.
+
+  Microsoft Entra: there is no single portal export with scopes per user.
+    Run the PowerShell below (Microsoft Graph module, Directory.Read.All and
+    AuditLog.Read.All) and use --preset entra. Test it on a small scope first.
+
+    Connect-MgGraph -Scopes Directory.Read.All,AuditLog.Read.All
+    $since = (Get-Date).AddDays(-30).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $last = @{}
+    Get-MgAuditLogSignIn -All -Filter "createdDateTime ge $since" |
+      ForEach-Object { $k = "$($_.AppId)|$($_.UserPrincipalName)"
+        if (-not $last[$k] -or $_.CreatedDateTime -gt $last[$k]) { $last[$k] = $_.CreatedDateTime } }
+    Get-MgOauth2PermissionGrant -All | ForEach-Object {
+      $sp = Get-MgServicePrincipal -ServicePrincipalId $_.ClientId
+      $upn = if ($_.PrincipalId) { (Get-MgUser -UserId $_.PrincipalId).UserPrincipalName } else { "ALL USERS" }
+      [pscustomobject]@{ DisplayName = $sp.DisplayName; UserPrincipalName = $upn
+        Scope = $_.Scope; LastSignIn = $last["$($sp.AppId)|$upn"] }
+    } | Export-Csv entra_grants.csv -NoTypeInformation
+
+    Sign-in logs only go back 30 days on most plans, so a blank LastSignIn
+    means "not seen in 30 days", which the scanner treats as stale.
+
+Other sources: map your own column names with --map, e.g.
   --map app="Application Name" user="User email" scopes=Scopes last_used="Last used"
   --web-map user="Source user" domain="Destination host"
 
 Standard library only, Python 3.9+. Read-only: it never changes or revokes
 anything. Edit AI_DOMAINS and RISKY_SCOPES to suit your company.
-Usage: python ai_access_scan.py --apps oauth_export.csv [--web proxy_log.csv]
+Usage: python ai_access_scan.py --apps oauth_export.csv [--preset google] [--web proxy_log.csv]
+
+Exit codes: 0 = success, 1 = error, 2 = no AI tools found.
 """
 import argparse
 import csv
@@ -57,16 +87,25 @@ RISKY_SCOPES = {
     "admin.directory": "Google admin directory", "calendar": "full calendar",
     "mail.readwrite": "read and change Outlook mail", "mail.send": "send Outlook mail",
     "mail.read": "read all Outlook mail",
-    "files.readwrite.all": "all OneDrive/SharePoint files",
-    "sites.readwrite.all": "all SharePoint sites",
+    "files.readwrite.all": "change all OneDrive/SharePoint files",
+    "files.read.all": "read all OneDrive/SharePoint files",
+    "sites.read.all": "read all SharePoint sites",
+    "sites.readwrite.all": "change all SharePoint sites",
     "directory.readwrite.all": "change the directory",
     "offline_access": "keeps access when the user is away",
     "refresh_token": "long-lived access",
     "full": "broad access (Salesforce/CRM)",
-    "api": "API access (check scope details)",
+    "api": "API access (check scope details — may be broad)",
 }
 PREFIX_SCOPES = {"admin.directory"}  # admin.directory.user, .group... all count
 STALE_DAYS = 90
+
+PRESETS = {
+    "google": {"app": "Application name", "user": "User", "scopes": "Scope",
+               "last_used": "Date", "event": "Event"},
+    "entra": {"app": "DisplayName", "user": "UserPrincipalName", "scopes": "Scope",
+              "last_used": "LastSignIn"},
+}
 
 
 def classify(name):
@@ -98,6 +137,15 @@ def classify(name):
     return None
 
 
+def _clean_domain(domain):
+    """Strip protocol, path, and query string from a domain."""
+    domain = domain.strip().lower()
+    domain = re.sub(r"^https?://", "", domain)
+    domain = domain.split("/")[0]
+    domain = domain.split("?")[0]
+    return domain
+
+
 def risky(scopes):
     """Return a sorted list of risky scope descriptions found in the scope string."""
     hits = []
@@ -113,32 +161,41 @@ def risky(scopes):
 
 
 def parse_date(text):
+    """Accept ISO dates, US and day-first dates, and console-style 'Oct 15, 2026, ...'."""
     text = (text or "").strip()
     if not text:
         return None
-    formats = (
-        "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S.%f%z",
-        "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S",
-        "%m/%d/%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S",
-    )
-    for fmt in formats:
+    # ISO 8601 (with or without timezone, with or without milliseconds)
+    try:
+        d = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    # Console-style: "Oct 15, 2026, 2:03 PM GMT-7"
+    m = re.match(r"([A-Z][a-z]{2}) (\d{1,2}), (\d{4})", text)
+    if m:
         try:
-            d = datetime.strptime(text, fmt)
-            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+            return datetime.strptime(" ".join(m.groups()), "%b %d %Y").replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    # Drop time part and try common date formats
+    date_part = text.split(" ")[0]
+    for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d", "%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(date_part, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
-    # Try Unix timestamp
+    # Unix timestamp fallback
     try:
         ts = float(text)
-        if ts > 1_000_000_000:  # plausible Unix timestamp
+        if ts > 1_000_000_000:
             return datetime.fromtimestamp(ts, tz=timezone.utc)
     except (ValueError, OSError, OverflowError):
         pass
     return None
 
 
-def load(path, mapping, needed):
+def load(path, mapping, needed, optional=()):
     """Load a CSV file and return a list of dicts with normalized keys."""
     try:
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -149,7 +206,8 @@ def load(path, mapping, needed):
             missing = [c for c in cols.values() if c not in reader.fieldnames]
             if missing:
                 sys.exit(f"{path}: missing column(s) {missing}. Found: {reader.fieldnames}. "
-                         f"Use --map to specify column names.")
+                         f"Use --preset or --map.")
+            cols.update({k: mapping[k] for k in optional if mapping.get(k) in reader.fieldnames})
             rows = list(reader)
             if not rows:
                 print(f"Warning: {path} has headers but no data rows.", file=sys.stderr)
@@ -163,18 +221,31 @@ def load(path, mapping, needed):
 
 
 def scan_apps(rows, now):
-    apps = defaultdict(lambda: {"users": set(), "scopes": set(), "last": None})
+    # Event logs (Google) hold one row per grant, revoke or API call. Keep the
+    # newest row per app and user; drop pairs whose newest event is a revoke.
+    latest = {}
     for r in rows:
-        label = classify(r["app"])
-        if not label:
+        if not classify(r["app"]):
             continue
-        a = apps[r["app"]]
-        a["label"] = label
-        a["users"].add(r["user"])
-        a["scopes"].update(risky(r["scopes"]))
+        key = (r["app"], r["user"])
         d = parse_date(r["last_used"])
-        if d and (a["last"] is None or d > a["last"]):
-            a["last"] = d
+        prev = latest.get(key)
+        if prev is None or (d and (prev["_d"] is None or d >= prev["_d"])):
+            latest[key] = {**r, "_d": d, "scope_set": set(risky(r["scopes"])) |
+                           (prev["scope_set"] if prev else set())}
+        else:
+            prev["scope_set"] |= set(risky(r["scopes"]))
+
+    apps = defaultdict(lambda: {"users": set(), "scopes": set(), "last": None})
+    for (name, user), r in latest.items():
+        if "revoke" in r.get("event", "").lower():
+            continue
+        a = apps[name]
+        a["label"] = classify(name)
+        a["users"].add(user)
+        a["scopes"] |= r["scope_set"]
+        if r["_d"] and (a["last"] is None or r["_d"] > a["last"]):
+            a["last"] = r["_d"]
     results = []
     for name, a in apps.items():
         stale = a["last"] is None or (now - a["last"]) > timedelta(days=STALE_DAYS)
@@ -187,8 +258,7 @@ def scan_apps(rows, now):
 def scan_web(rows):
     use = defaultdict(lambda: defaultdict(int))
     for r in rows:
-        domain = re.sub(r"^https?://", "", r["domain"].strip().lower())
-        domain = domain.split("/")[0].split("?")[0]
+        domain = _clean_domain(r["domain"])
         label = classify(domain)
         if label and label != "Possible AI tool (check)":
             use[label][r["user"]] += 1
@@ -211,6 +281,8 @@ def main():
     )
     p.add_argument("--apps", required=True, help="CSV of OAuth app grants")
     p.add_argument("--web", help="CSV of web/proxy traffic (optional)")
+    p.add_argument("--preset", choices=sorted(PRESETS),
+                   help="Column names for a known export (google, entra)")
     p.add_argument("--map", nargs="*", default=[],
                    help='Apps file column mapping: key="Column name" pairs. '
                         'Keys: app, user, scopes, last_used. '
@@ -234,19 +306,32 @@ def main():
         k, v = m.split("=", 1)
         mapping[k.strip()] = v.strip().strip('"').strip("'")
 
+    # Merge preset (preset values are defaults; --map overrides)
+    mapping = {**PRESETS.get(args.preset or "", {}), **mapping}
+
+    # Validate --web-map syntax
+    web_mapping = {}
+    for m in args.web_map:
+        if "=" not in m:
+            sys.exit(f"Error: invalid --web-map entry '{m}'. Expected format: key=\"Column name\"")
+        k, v = m.split("=", 1)
+        web_mapping[k.strip()] = v.strip().strip('"').strip("'")
+
     now = datetime.now(timezone.utc)
 
-    rows = load(args.apps, mapping, ["app", "user", "scopes", "last_used"])
+    rows = load(args.apps, mapping, ["app", "user", "scopes", "last_used"], optional=["event"])
     apps = scan_apps(rows, now)
 
     if not apps:
         print("No AI tools found in the apps export.", file=sys.stderr)
-        # Still write empty register
-        with open(args.out, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["Tool or agent", "Owner", "Systems it can reach",
-                        "Can it act or only read?", "Who approves its actions",
-                        "Review date", "Risk", "Users", "Last used", "Decision"])
+        try:
+            with open(args.out, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["Tool or agent", "Owner", "Systems it can reach",
+                            "Can it act or only read?", "Who approves its actions",
+                            "Review date", "Risk", "Users", "Last used", "Decision"])
+        except (OSError, IOError) as e:
+            sys.exit(f"Error writing output file: {e}")
         print(f"Empty register written to {args.out}.")
         sys.exit(2)
 
@@ -255,18 +340,12 @@ def main():
     for a in apps:
         last = a["last"].date().isoformat() if a["last"] else "never/unknown"
         print(f"[{a['level']}] {a['name']}  ({a['label']})")
-        print(f"   users: {len(a['users'])}   last used: {last}")
+        who = "ALL USERS (tenant-wide consent)" if "ALL USERS" in a["users"] else len(a["users"])
+        print(f"   users: {who}   last used: {last}")
         if a["scopes"]:
             print(f"   access: {', '.join(sorted(a['scopes']))}")
         if a["level"] == "HIGH":
             print("   -> revoke unless someone can name a current use")
-
-    web_mapping = {}
-    for m in args.web_map:
-        if "=" not in m:
-            sys.exit(f"Error: invalid --web-map entry '{m}'. Expected format: key=\"Column name\"")
-        k, v = m.split("=", 1)
-        web_mapping[k.strip()] = v.strip().strip('"').strip("'")
 
     web = {}
     if args.web:
@@ -292,7 +371,8 @@ def main():
                 acts = any(k in s for s in a["scopes"] for k in ("send", "change", "full", "modify"))
                 w.writerow([a["name"], "", "; ".join(sorted(a["scopes"])) or "limited",
                             "Can act" if acts else "Read only / unclear", "", review, a["level"],
-                            len(a["users"]), a["last"].date().isoformat() if a["last"] else "unknown",
+                            "all" if "ALL USERS" in a["users"] else len(a["users"]),
+                            a["last"].date().isoformat() if a["last"] else "unknown",
                             "keep / revoke?"])
             for label, users in web.items():
                 if not is_approved(label, args.approved):
